@@ -14,398 +14,349 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/joho/godotenv"
 
-	// AWS SDK
+	// Go Cors 용
+	"github.com/rs/cors" // 라이브러리 임포트
+
+	// AWS SDK (Secrets Manager용)
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 )
 
 //==============================================================
-// 1. 모델 정의 (Model)
+// 1. 모델 정의 (Model) - DB 스키마와 1:1 매핑
 //==============================================================
 
-// Document는 RAG 시스템에서 Context로 사용될 문서의 구조입니다.
-// museumdb의 Item 테이블 구조에 맞춤
-type Document struct {
-	ThemeID   string  `json:"theme_id"`
-	ItemSeq   int     `json:"item_seq"`
-	ItemName  string  `json:"item_name"`
-	ItemDesc  string  `json:"item_desc"`
-	Latitude  float64 `json:"latitude,omitempty"`
-	Longitude float64 `json:"longitude,omitempty"`
-	TargetAge int     `json:"target_age,omitempty"`
+// Theme: 테마 (대묶음)
+type Theme struct {
+	ThemeID   string `json:"theme_id"`
+	ThemeName string `json:"theme_name"`
+	ThemeDesc string `json:"theme_desc"`
 }
 
-// RAGRequest는 사용자로부터 받는 LLM 질문 요청 구조입니다.
-type RAGRequest struct {
-	Query string `json:"query"`
+// Item: 전시물 상세 정보 (스크립트 포함)
+type Item struct {
+	ThemeID       string  `json:"theme_id"`
+	ItemSeq       int     `json:"item_seq"`
+	ItemName      string  `json:"item_name"`
+	ItemDesc      string  `json:"item_desc"`      // 핵심 메시지
+	ScriptChild   string  `json:"script_child"`   // 어린이용 해설
+	ScriptGeneral string  `json:"script_general"` // 일반인용 해설
+	Latitude      float64 `json:"latitude"`
+	Longitude     float64 `json:"longitude"`
 }
 
-// RAGResponse는 LLM 응답을 클라이언트에게 반환하는 구조입니다.
-type RAGResponse struct {
-	Answer  string   `json:"answer"`
-	Sources []string `json:"sources"` // RAG에 사용된 출처 (문서 제목 등)
+// Quiz: 퀴즈 정보
+type Quiz struct {
+	ThemeID  string `json:"theme_id"`
+	QuizNo   int    `json:"quiz_no"`
+	Question string `json:"question"`
+	Answer   string `json:"answer"`
+	Options  string `json:"options"` // 보기 (JSON 문자열 또는 콤마 구분)
+	QuizDesc string `json:"quiz_desc"`
+}
+
+// Recipient: 수령자 정보 (입력용 구조체)
+type RecipientRequest struct {
+	ThemeID string `json:"theme_id"`
+	Email   string `json:"email"`
+	// RecvDate string `json:"recv_date"` // YYYY-MM-DD
+	// RecvTime string `json:"recv_time"` // HH:MM:SS
 }
 
 //==============================================================
 // 2. Repository 계층 (DB Access)
 //==============================================================
 
-// DBRepository는 데이터베이스 접근 메서드를 정의합니다.
 type DBRepository struct {
 	DB *sql.DB
 }
 
-// NewDBRepository는 DBRepository 인스턴스를 생성합니다.
 func NewDBRepository(db *sql.DB) *DBRepository {
 	return &DBRepository{DB: db}
 }
 
-// GetDocumentByID는 특정 ITEM_SEQ의 문서를 조회합니다. (Item 테이블 조회)
-func (r *DBRepository) GetDocumentByID(ctx context.Context, itemSeq int) (*Document, error) {
-	// museumdb의 Item 테이블에서 데이터를 조회하는 쿼리입니다.
-	query := `SELECT THEME_ID, ITEM_SEQ, ITEM_NAME, ITEM_DESC, 
-	                 COALESCE(LATITUDE, 0), COALESCE(LONGITUDE, 0), COALESCE(TARGET_AGE, 0)
-	          FROM Item 
-	          WHERE ITEM_SEQ = ?`
-	doc := &Document{}
+// 1. 테마 전체 조회
+func (r *DBRepository) GetAllThemes(ctx context.Context) ([]Theme, error) {
+	query := `SELECT THEME_ID, THEME_NAME, COALESCE(THEME_DESC, ''), CREATED_AT FROM Theme`
 
-	// DB 연결 상태 및 오류 확인
-	if r.DB == nil {
-		return nil, fmt.Errorf("데이터베이스 연결이 초기화되지 않았습니다")
-	}
-
-	err := r.DB.QueryRowContext(ctx, query, itemSeq).Scan(
-		&doc.ThemeID, &doc.ItemSeq, &doc.ItemName, &doc.ItemDesc,
-		&doc.Latitude, &doc.Longitude, &doc.TargetAge)
-	if err == sql.ErrNoRows {
-		return nil, nil // 문서 없음
-	}
+	rows, err := r.DB.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("문서 조회 오류: %w", err)
+		return nil, err
 	}
-	return doc, nil
-}
+	defer rows.Close()
 
-// GetRelevantContext는 RAG에 필요한 Context를 조회합니다. (RAG Retrieval 단계)
-// 이 예시에서는 DB에서 모든 문서를 조회하지만, 실제로는 벡터 검색 쿼리가 들어갑니다.
-func (r *DBRepository) GetRelevantContext(ctx context.Context, query string) ([]*Document, error) {
-	log.Printf("RAG Context Retrieval: 사용자 쿼리 '%s'에 대한 관련 문서 검색 중...", query)
-
-	// TODO: 실제 RAG 시스템에서는 'query'의 임베딩을 생성하고,
-	// 벡터 DB(OpenSearch, ChromaDB 등)에 유사도 검색(Vector Search)을 수행해야 합니다.
-
-	// 임시 Placeholder: ID가 1과 2인 문서를 가져온다고 가정
-	doc1, _ := r.GetDocumentByID(ctx, 1)
-	doc2, _ := r.GetDocumentByID(ctx, 2)
-
-	documents := make([]*Document, 0)
-	if doc1 != nil {
-		documents = append(documents, doc1)
+	var themes []Theme
+	for rows.Next() {
+		var t Theme
+		// CREATED_AT은 DB 설정에 따라 []uint8로 올 수 있어 string 변환이 필요할 수 있으나,
+		// Scan 시 string 변수에 넣으면 드라이버가 자동 변환을 시도합니다.
+		if err := rows.Scan(&t.ThemeID, &t.ThemeName, &t.ThemeDesc); err != nil {
+			return nil, err
+		}
+		themes = append(themes, t)
 	}
-	if doc2 != nil {
-		documents = append(documents, doc2)
-	}
-
-	return documents, nil
+	return themes, nil
 }
 
-//==============================================================
-// 3. Service 계층 (Business Logic & LLM/RAG)
-//==============================================================
+// 2. 테마별 아이템 전체 조회
+func (r *DBRepository) GetItemsByTheme(ctx context.Context, themeID string) ([]Item, error) {
+	query := `SELECT 
+				THEME_ID, ITEM_SEQ, ITEM_NAME, 
+				COALESCE(ITEM_DESC, ''), 
+				COALESCE(SCRIPT_CHILD, ''), 
+				COALESCE(SCRIPT_GENERAL, ''), 
+				COALESCE(LATITUDE, 0.0), 
+				COALESCE(LONGITUDE, 0.0) 
+			  FROM Item 
+			  WHERE THEME_ID = ? 
+			  ORDER BY ITEM_SEQ ASC`
 
-// LLMService는 비즈니스 로직과 외부 LLM API 통신을 담당합니다.
-type LLMService struct {
-	Repo *DBRepository
-	// LLMClient는 실제 LLM API 클라이언트 구조체가 될 수 있습니다.
-	// (예: Gemini Client, OpenAI Client 등)
-}
-
-// NewLLMService는 LLMService 인스턴스를 생성합니다.
-func NewLLMService(repo *DBRepository) *LLMService {
-	return &LLMService{Repo: repo}
-}
-
-// ProcessRAG는 RAG 전체 로직을 수행합니다.
-func (s *LLMService) ProcessRAG(ctx context.Context, query string) (*RAGResponse, error) {
-	// 1. Context Retrieval (Repository 호출)
-	documents, err := s.Repo.GetRelevantContext(ctx, query)
+	rows, err := r.DB.QueryContext(ctx, query, themeID)
 	if err != nil {
-		return nil, fmt.Errorf("RAG Context 조회 실패: %w", err)
+		return nil, err
 	}
+	defer rows.Close()
 
-	if len(documents) == 0 {
-		return &RAGResponse{Answer: "관련 정보를 찾을 수 없습니다.", Sources: []string{}}, nil
+	var items []Item
+	for rows.Next() {
+		var i Item
+		if err := rows.Scan(&i.ThemeID, &i.ItemSeq, &i.ItemName, &i.ItemDesc,
+			&i.ScriptChild, &i.ScriptGeneral, &i.Latitude, &i.Longitude); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
 	}
+	return items, nil
+}
 
-	// 2. Prompt 구성
-	var contextString string
-	var sources []string
-	for _, doc := range documents {
-		contextString += fmt.Sprintf("장소명: %s\n설명: %s\n위도/경도: %.7f, %.7f\n---\n",
-			doc.ItemName, doc.ItemDesc, doc.Latitude, doc.Longitude)
-		sources = append(sources, doc.ItemName)
+// 3. 테마별 퀴즈 조회
+func (r *DBRepository) GetQuizzesByTheme(ctx context.Context, themeID string) ([]Quiz, error) {
+	query := `SELECT 
+				THEME_ID, QUIZ_NO, QUESTION, ANSWER, 
+				COALESCE(OPTIONS, ''), 
+				COALESCE(QUIZ_DESC, '') 
+			  FROM Quiz 
+			  WHERE THEME_ID = ? 
+			  ORDER BY QUIZ_NO ASC`
+
+	rows, err := r.DB.QueryContext(ctx, query, themeID)
+	if err != nil {
+		return nil, err
 	}
+	defer rows.Close()
 
-	// LLM에 전달할 최종 프롬프트
-	prompt := fmt.Sprintf("다음 정보를 참고하여 사용자 질문에 가장 적절하게 답변해주세요. 정보:\n%s\n\n사용자 질문: %s", contextString, query)
-	log.Printf("LLM 호출을 위한 최종 프롬프트:\n%s", prompt)
+	var quizzes []Quiz
+	for rows.Next() {
+		var q Quiz
+		if err := rows.Scan(&q.ThemeID, &q.QuizNo, &q.Question, &q.Answer, &q.Options, &q.QuizDesc); err != nil {
+			return nil, err
+		}
+		quizzes = append(quizzes, q)
+	}
+	return quizzes, nil
+}
 
-	// 3. LLM API 호출 (Placeholder)
-	// TODO: 실제로 외부 LLM API에 HTTP 요청을 보내고 응답을 받아야 합니다.
-	// 예: Gemini API, OpenAI API 등을 사용하는 로직 구현
-	llmAnswer := fmt.Sprintf("LLM 응답: 당신의 질문 '%s'은(는) [%s] 정보를 바탕으로 처리되었습니다.", query, sources[0])
+// 4. 수령자 등록 (INSERT)
+func (r *DBRepository) AddRecipient(ctx context.Context, req RecipientRequest) error {
+	query := `INSERT INTO Recipient (THEME_ID, EMAIL, RECV_DATE, RECV_TIME) VALUES (?, ?, ?, ?)`
 
-	return &RAGResponse{
-		Answer:  llmAnswer,
-		Sources: sources,
-	}, nil
+	_, err := r.DB.ExecContext(ctx, query, req.ThemeID, req.Email)
+	return err
 }
 
 //==============================================================
-// 4. Handler 계층 (HTTP Request/Response)
+// 3. Handler 계층 (HTTP Request/Response)
 //==============================================================
 
-// Handler는 HTTP 요청 처리를 위한 구조체입니다.
 type Handler struct {
-	Service *LLMService
+	Repo *DBRepository
 }
 
-// NewHandler는 Handler 인스턴스를 생성합니다.
-func NewHandler(service *LLMService) *Handler {
-	return &Handler{Service: service}
+func NewHandler(repo *DBRepository) *Handler {
+	return &Handler{Repo: repo}
 }
 
-// GetDataHandler는 일반 데이터 조회를 처리하는 HTTP 핸들러입니다.
-func (h *Handler) GetDataHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		http.Error(w, "GET 메서드만 허용됩니다", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// 쿼리 파라미터에서 ITEM_SEQ를 가져옴 (예: ?id=1 또는 ?item_seq=1)
-	itemSeqStr := r.URL.Query().Get("id")
-	if itemSeqStr == "" {
-		itemSeqStr = r.URL.Query().Get("item_seq")
-	}
-	var itemSeq int
-	if itemSeqStr == "" {
-		http.Error(w, "item_seq 파라미터가 필요합니다 (예: ?id=1)", http.StatusBadRequest)
-		return
-	}
-	fmt.Sscanf(itemSeqStr, "%d", &itemSeq)
-
-	doc, err := h.Service.Repo.GetDocumentByID(r.Context(), itemSeq)
+// GET /api/themes : 테마 목록 조회
+func (h *Handler) GetThemesHandler(w http.ResponseWriter, r *http.Request) {
+	themes, err := h.Repo.GetAllThemes(r.Context())
 	if err != nil {
-		log.Printf("DB 조회 오류: %v", err)
-		http.Error(w, "데이터 조회 중 서버 오류 발생", http.StatusInternalServerError)
-		return
-	}
-
-	if doc == nil {
-		http.Error(w, "문서를 찾을 수 없습니다", http.StatusNotFound)
+		http.Error(w, "테마 조회 실패: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(doc)
+	json.NewEncoder(w).Encode(themes)
 }
 
-// RAGHandler는 LLM을 이용한 RAG 처리를 담당하는 HTTP 핸들러입니다.
-func (h *Handler) RAGHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+// GET /api/items?theme_id=XXX : 테마별 아이템 조회
+func (h *Handler) GetItemsHandler(w http.ResponseWriter, r *http.Request) {
+	themeID := r.URL.Query().Get("theme_id")
+	if themeID == "" {
+		http.Error(w, "theme_id 파라미터가 필요합니다", http.StatusBadRequest)
+		return
+	}
+
+	items, err := h.Repo.GetItemsByTheme(r.Context(), themeID)
+	if err != nil {
+		http.Error(w, "아이템 조회 실패: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(items)
+}
+
+// GET /api/quizzes?theme_id=XXX : 테마별 퀴즈 조회
+func (h *Handler) GetQuizzesHandler(w http.ResponseWriter, r *http.Request) {
+	themeID := r.URL.Query().Get("theme_id")
+	if themeID == "" {
+		http.Error(w, "theme_id 파라미터가 필요합니다", http.StatusBadRequest)
+		return
+	}
+
+	quizzes, err := h.Repo.GetQuizzesByTheme(r.Context(), themeID)
+	if err != nil {
+		http.Error(w, "퀴즈 조회 실패: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(quizzes)
+}
+
+// POST /api/recipient : 수령자 등록
+func (h *Handler) AddRecipientHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
 		http.Error(w, "POST 메서드만 허용됩니다", http.StatusMethodNotAllowed)
 		return
 	}
 
-	var req RAGRequest
+	var req RecipientRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "요청 본문(JSON) 파싱 오류", http.StatusBadRequest)
+		http.Error(w, "JSON 파싱 오류", http.StatusBadRequest)
 		return
 	}
 
-	if req.Query == "" {
-		http.Error(w, "질문(Query) 내용이 비어있습니다", http.StatusBadRequest)
+	// 간단한 유효성 검사
+	if req.ThemeID == "" || req.Email == "" {
+		http.Error(w, "theme_id와 email은 필수값입니다", http.StatusBadRequest)
 		return
 	}
 
-	// Service 계층의 RAG 처리 로직 호출
-	response, err := h.Service.ProcessRAG(r.Context(), req.Query)
+	err := h.Repo.AddRecipient(r.Context(), req)
 	if err != nil {
-		log.Printf("RAG 처리 중 오류: %v", err)
-		http.Error(w, "LLM 처리 중 서버 오류 발생", http.StatusInternalServerError)
+		log.Printf("수령자 등록 오류: %v", err)
+		http.Error(w, "수령자 등록 중 서버 오류", http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(response)
+	w.WriteHeader(http.StatusCreated)
+	w.Write([]byte(`{"message": "success"}`))
 }
 
 //==============================================================
-// 5. Main 함수 (Initialization & Routing)
+// 4. Main (설정 및 실행)
 //==============================================================
 
-// DBCredentials는 Secrets Manager에서 가져올 DB 정보 구조체입니다.
+// DBCredentials 등 기존 AWS Secrets Manager 관련 구조체는 동일하게 유지
 type DBCredentials struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 }
 
-// getSecretFromAWS는 AWS Secrets Manager에서 비밀 정보를 가져옵니다.
 func getSecretFromAWS(secretName string, region string) (*DBCredentials, error) {
-	// AWS 설정 로드 (EC2 인스턴스 역할 또는 로컬 자격 증명 사용)
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
 	if err != nil {
-		return nil, fmt.Errorf("AWS 설정 로드 실패: %w", err)
+		return nil, fmt.Errorf("AWS config error: %w", err)
 	}
-
-	// Secrets Manager 클라이언트 생성
 	client := secretsmanager.NewFromConfig(cfg)
-
-	// Secret 가져오기
-	result, err := client.GetSecretValue(context.TODO(), &secretsmanager.GetSecretValueInput{
-		SecretId: &secretName,
-	})
+	result, err := client.GetSecretValue(context.TODO(), &secretsmanager.GetSecretValueInput{SecretId: &secretName})
 	if err != nil {
-		return nil, fmt.Errorf("Secret 조회 실패: %w", err)
+		return nil, err
 	}
-
-	// JSON 파싱
 	var creds DBCredentials
-	if err := json.Unmarshal([]byte(*result.SecretString), &creds); err != nil {
-		return nil, fmt.Errorf("Secret JSON 파싱 실패: %w", err)
-	}
-
+	json.Unmarshal([]byte(*result.SecretString), &creds)
 	return &creds, nil
 }
 
 func main() {
-	// .env 파일 로드 (로컬 개발용, 없어도 무방)
-	err := godotenv.Load(".env")
+	_ = godotenv.Load(".env") // 로컬 개발용
+
+	// DB 연결 설정 (기존 로직 유지)
+	dbUser := os.Getenv("DB_USER")
+	dbPass := os.Getenv("DB_PASS")
+	dbHost := os.Getenv("DB_HOST")
+	dbPort := os.Getenv("DB_PORT")
+	dbName := os.Getenv("DB_NAME")
+
+	// AWS Secrets Manager 로직 (환경변수에 따라 실행)
+	if os.Getenv("USE_SECRETS_MANAGER") == "true" {
+		creds, err := getSecretFromAWS(os.Getenv("SECRET_NAME"), os.Getenv("AWS_REGION"))
+		if err == nil {
+			dbUser = creds.Username
+			dbPass = creds.Password
+			log.Println("AWS Secrets Manager credentials loaded.")
+		}
+	}
+
+	if dbPort == "" {
+		dbPort = "3306"
+	}
+	// 로컬 테스트 시 기본값
+	if dbHost == "" {
+		dbHost = "localhost"
+		dbName = "museumdb"
+		dbUser = "root"
+	}
+
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+		dbUser, dbPass, dbHost, dbPort, dbName)
+
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		log.Println("Note: .env 파일을 찾을 수 없습니다. AWS Secrets Manager를 사용합니다.")
+		log.Fatalf("DB Open Error: %v", err)
 	}
 
-	// 1. AWS Secrets Manager에서 DB 자격 증명 가져오기
-	// SECRET_NAME 환경 변수로 Secret 이름 지정 (예: "hamo/rds/credentials")
-	secretName := os.Getenv("SECRET_NAME")
-	if secretName == "" {
-		secretName = "hamo/rds/credentials" // 기본값
-	}
+	// [추가] DB 연결 풀 설정 (time 패키지 사용으로 에러 해결 및 DB 연결 끊김 방지)
+	db.SetConnMaxLifetime(time.Minute * 3)
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(10)
 
-	// AWS Region 설정 (환경 변수 또는 기본값)
-	awsRegion := os.Getenv("AWS_REGION")
-	if awsRegion == "" {
-		awsRegion = "ap-northeast-2" // 기본값: 서울 리전
-	}
-
-	var dbUser, dbPass, dbHost, dbPort, dbName string
-
-	// AWS Secrets Manager 사용 여부 확인 (로컬 개발 시 .env 사용 가능)
-	useSecretsManager := os.Getenv("USE_SECRETS_MANAGER")
-	if useSecretsManager == "true" || useSecretsManager == "1" {
-		// Secrets Manager에서는 username, password만 가져옴
-		log.Printf("AWS Secrets Manager에서 DB 인증 정보를 가져옵니다: %s (Region: %s)", secretName, awsRegion)
-		creds, err := getSecretFromAWS(secretName, awsRegion)
-		if err != nil {
-			log.Fatalf("AWS Secrets Manager 조회 실패: %v", err)
-		}
-		dbUser = creds.Username
-		dbPass = creds.Password
-		log.Println("AWS Secrets Manager에서 DB 인증 정보를 성공적으로 가져왔습니다.")
-
-		// Host, Port, DBName은 환경 변수에서 가져옴
-		dbHost = os.Getenv("DB_HOST")
-		dbPort = os.Getenv("DB_PORT")
-		if dbPort == "" {
-			dbPort = "3306"
-		}
-		dbName = os.Getenv("DB_NAME")
-
-		// 필수 값 확인
-		if dbHost == "" {
-			log.Fatal("DB_HOST 환경 변수가 설정되지 않았습니다.")
-		}
-		if dbName == "" {
-			log.Fatal("DB_NAME 환경 변수가 설정되지 않았습니다.")
-		}
-	} else {
-		// 로컬 개발용: 환경 변수 사용
-		log.Println("환경 변수에서 DB 정보를 가져옵니다 (로컬 개발 모드).")
-		dbUser = os.Getenv("DB_USER")
-		dbPass = os.Getenv("DB_PASS")
-		dbHost = os.Getenv("DB_HOST")
-		dbPort = os.Getenv("DB_PORT")
-		if dbPort == "" {
-			dbPort = "3306"
-		}
-		dbName = os.Getenv("DB_NAME")
-
-		// DB 설정이 없는 경우 임시로 기본값 사용
-		if dbUser == "" {
-			dbUser = "user"
-			dbPass = ""
-			dbHost = "localhost"
-			dbName = "ragdb"
-			log.Println("경고: 환경 변수가 설정되지 않아 임시 DB 연결 정보를 사용합니다.")
+	// DB 연결 테스트 (Ping)
+	if os.Getenv("SKIP_DB_CHECK") != "true" {
+		if err := db.Ping(); err != nil {
+			log.Printf("DB 연결 실패 (설정 확인 필요): %v", err)
+		} else {
+			log.Println("DB 연결 성공")
 		}
 	}
+	defer db.Close()
 
-	// SKIP_DB_CHECK: if set to "1" or "true", skip pinging the DB (useful when using SSH/SSM port forwarding or testing without DB)
-	skipDBCheck := false
-	skipEnv := os.Getenv("SKIP_DB_CHECK")
-	if skipEnv == "1" || skipEnv == "true" || skipEnv == "TRUE" {
-		skipDBCheck = true
-	}
-
-	// 2. AWS RDS MySQL 연결 (선택적으로 건너뛰기 가능)
-	var db *sql.DB
-	if skipDBCheck {
-		log.Println("SKIP_DB_CHECK=true: DB 연결 확인을 건너뜁니다. (로컬 포트 포워딩 사용 중일 수 있음)")
-		db = nil
-	} else {
-		dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
-			dbUser, dbPass, dbHost, dbPort, dbName)
-
-		var err error
-		db, err = sql.Open("mysql", dsn)
-		if err != nil {
-			log.Fatalf("MySQL 드라이버 초기화 실패: %v", err)
-		}
-
-		// DB 연결 확인
-		db.SetConnMaxLifetime(time.Minute * 3)
-		db.SetMaxOpenConns(10)
-		db.SetMaxIdleConns(10)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err = db.PingContext(ctx); err != nil {
-			log.Fatalf("AWS RDS MySQL 연결 실패 (VPC 설정 확인 필요): %v", err)
-		}
-		log.Println("AWS RDS MySQL (VPC 내부) 연결 성공.")
-		defer db.Close()
-	}
-
-	// 3. 계층 구조 초기화 및 의존성 주입
+	// Repository & Handler 초기화
 	repo := NewDBRepository(db)
-	service := NewLLMService(repo)
-	handler := NewHandler(service)
+	handler := NewHandler(repo)
 
-	// 4. 라우팅 설정 (Go 표준 라이브러리 사용)
-	http.HandleFunc("/api/data", handler.GetDataHandler)
-	http.HandleFunc("/api/rag", handler.RAGHandler)
+	mux := http.NewServeMux()
 
-	// 5. 서버 시작
+	// 라우팅
+	// mux에 핸들러를 등록합니다.
+	mux.HandleFunc("/api/themes", handler.GetThemesHandler)       // 1. 테마 전체 조회
+	mux.HandleFunc("/api/items", handler.GetItemsHandler)         // 2. 테마별 아이템 조회
+	mux.HandleFunc("/api/quizzes", handler.GetQuizzesHandler)     // 3. 테마별 퀴즈 조회
+	mux.HandleFunc("/api/recipient", handler.AddRecipientHandler) // 4. 수령자 등록
+
+	c := cors.New(cors.Options{
+		AllowedOrigins:   []string{"*"}, // 모든 출처 허용 (친구 접속 OK)
+		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type", "Authorization"},
+		AllowCredentials: true,
+		Debug:            true, // true로 하면 서버 로그에 CORS 요청 내역이 찍혀서 디버깅하기 좋습니다.
+	})
+
+	handlerWithCors := c.Handler(mux)
+
 	port := "8080"
-	log.Printf("Go 서버가 포트 %s에서 시작됩니다. (EC2 배포 환경)", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatalf("서버 실행 오류: %v", err)
+	if err := http.ListenAndServe(":"+port, handlerWithCors); err != nil {
+		log.Fatalf("서버 실행 실패: %v", err)
 	}
 }
-
-// 참고: Postman 등을 사용하여 RAGHandler 테스트 시 JSON 본문 형식
-// POST /api/rag
-// Body:
-// {
-//     "query": "Go 서버 개발 시 AWS VPC를 어떻게 구성해야 하나요?"
-// }

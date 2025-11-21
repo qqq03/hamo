@@ -159,12 +159,37 @@ sudo systemctl start hamo
 
 ## 📡 API 사용법
 
-### 1. 아이템 조회 (GET)
+서버는 포트 **8080**에서 실행되며, 두 개의 RESTful API 엔드포인트를 제공합니다.
+
+### API 엔드포인트 목록
+
+| 메서드 | 엔드포인트 | 설명 |
+|--------|-----------|------|
+| `GET` | `/api/data?id={item_seq}` | 특정 아이템 조회 |
+| `POST` | `/api/rag` | RAG 기반 질의응답 |
+
+---
+
+### 1. 아이템 조회 API
+
+**엔드포인트:** `GET /api/data`
+
+**설명:** Item 테이블에서 특정 ITEM_SEQ의 박물관 전시물 정보를 조회합니다.
+
+**쿼리 파라미터:**
+- `id` 또는 `item_seq` (필수): 조회할 아이템의 시퀀스 번호
+
+**요청 예시:**
 ```bash
-# 요청
+# curl 사용
 curl http://localhost:8080/api/data?id=1
 
-# 응답
+# PowerShell 사용
+Invoke-WebRequest -Uri "http://localhost:8080/api/data?id=1" -Method GET | Select-Object -Expand Content
+```
+
+**성공 응답 (200 OK):**
+```json
 {
   "theme_id": "TH001",
   "item_seq": 1,
@@ -176,19 +201,100 @@ curl http://localhost:8080/api/data?id=1
 }
 ```
 
-### 2. RAG 질의 (POST)
+**에러 응답:**
+- `400 Bad Request`: `id` 파라미터 누락
+  ```
+  item_seq 파라미터가 필요합니다 (예: ?id=1)
+  ```
+- `404 Not Found`: 해당 ID의 문서가 없음
+  ```
+  문서를 찾을 수 없습니다
+  ```
+- `500 Internal Server Error`: DB 조회 오류
+  ```
+  데이터 조회 중 서버 오류 발생
+  ```
+
+---
+
+### 2. RAG 질의응답 API
+
+**엔드포인트:** `POST /api/rag`
+
+**설명:** RAG(Retrieval-Augmented Generation) 시스템을 통해 사용자 질문에 답변합니다. 현재는 DB에서 ID 1, 2번 문서를 기반으로 응답하며, 향후 벡터 검색 및 LLM API가 통합될 예정입니다.
+
+**요청 헤더:**
+```
+Content-Type: application/json
+```
+
+**요청 본문:**
+```json
+{
+  "query": "사용자 질문 내용"
+}
+```
+
+**요청 예시:**
 ```bash
-# 요청
+# curl 사용
 curl -X POST http://localhost:8080/api/rag \
   -H "Content-Type: application/json" \
   -d '{"query":"진주 박물관에 대해 알려줘"}'
 
-# 응답
+# PowerShell 사용
+$body = @{query="진주 박물관에 대해 알려줘"} | ConvertTo-Json
+Invoke-WebRequest -Uri "http://localhost:8080/api/rag" `
+  -Method POST `
+  -Body $body `
+  -ContentType "application/json" | Select-Object -Expand Content
+```
+
+**성공 응답 (200 OK):**
+```json
 {
   "answer": "LLM 응답: 당신의 질문 '진주 박물관에 대해 알려줘'은(는) [진주성] 정보를 바탕으로 처리되었습니다.",
   "sources": ["진주성", "진주 박물관"]
 }
 ```
+
+**응답 필드 설명:**
+- `answer` (string): LLM이 생성한 답변 (현재는 Placeholder)
+- `sources` (array): RAG에 사용된 문서 출처 목록
+
+**에러 응답:**
+- `400 Bad Request`: 잘못된 JSON 형식 또는 query 누락
+  ```
+  요청 본문(JSON) 파싱 오류
+  질문(Query) 내용이 비어있습니다
+  ```
+- `405 Method Not Allowed`: GET 등 다른 메서드 사용
+  ```
+  POST 메서드만 허용됩니다
+  ```
+- `500 Internal Server Error`: RAG 처리 중 오류
+  ```
+  LLM 처리 중 서버 오류 발생
+  ```
+
+---
+
+### 테스트 도구
+
+**브라우저에서 테스트:**
+- 데이터 조회: http://localhost:8080/api/data?id=1
+
+**Postman/Thunder Client 사용:**
+1. 새 요청 생성
+2. 메서드: `POST`
+3. URL: `http://localhost:8080/api/rag`
+4. Headers: `Content-Type: application/json`
+5. Body (raw JSON):
+   ```json
+   {
+     "query": "진주 박물관에 대해 알려줘"
+   }
+   ```
 
 ## 📂 프로젝트 구조
 
