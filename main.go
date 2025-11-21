@@ -13,7 +13,10 @@ import (
 	// Go MySQL 드라이버
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/joho/godotenv"
-	// .env 파일 로더
+
+	// AWS SDK
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 )
 
 //==============================================================
@@ -241,46 +244,117 @@ func (h *Handler) RAGHandler(w http.ResponseWriter, r *http.Request) {
 // 5. Main 함수 (Initialization & Routing)
 //==============================================================
 
-func main() {
-	// .env 파일 로드 (현재 실행 파일이 있는 디렉토리에서 찾음)
-	// 파일이 없어도 에러 무시 (환경 변수를 직접 사용 가능)
-	err := godotenv.Load("hamo/.env")
+// DBCredentials는 Secrets Manager에서 가져올 DB 정보 구조체입니다.
+type DBCredentials struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// getSecretFromAWS는 AWS Secrets Manager에서 비밀 정보를 가져옵니다.
+func getSecretFromAWS(secretName string, region string) (*DBCredentials, error) {
+	// AWS 설정 로드 (EC2 인스턴스 역할 또는 로컬 자격 증명 사용)
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
 	if err != nil {
-		// hamo/.env가 없으면 현재 디렉토리의 .env 시도
-		err = godotenv.Load(".env")
+		return nil, fmt.Errorf("AWS 설정 로드 실패: %w", err)
+	}
+
+	// Secrets Manager 클라이언트 생성
+	client := secretsmanager.NewFromConfig(cfg)
+
+	// Secret 가져오기
+	result, err := client.GetSecretValue(context.TODO(), &secretsmanager.GetSecretValueInput{
+		SecretId: &secretName,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("Secret 조회 실패: %w", err)
+	}
+
+	// JSON 파싱
+	var creds DBCredentials
+	if err := json.Unmarshal([]byte(*result.SecretString), &creds); err != nil {
+		return nil, fmt.Errorf("Secret JSON 파싱 실패: %w", err)
+	}
+
+	return &creds, nil
+}
+
+func main() {
+	// .env 파일 로드 (로컬 개발용, 없어도 무방)
+	err := godotenv.Load(".env")
+	if err != nil {
+		log.Println("Note: .env 파일을 찾을 수 없습니다. AWS Secrets Manager를 사용합니다.")
+	}
+
+	// 1. AWS Secrets Manager에서 DB 자격 증명 가져오기
+	// SECRET_NAME 환경 변수로 Secret 이름 지정 (예: "hamo/rds/credentials")
+	secretName := os.Getenv("SECRET_NAME")
+	if secretName == "" {
+		secretName = "hamo/rds/credentials" // 기본값
+	}
+
+	// AWS Region 설정 (환경 변수 또는 기본값)
+	awsRegion := os.Getenv("AWS_REGION")
+	if awsRegion == "" {
+		awsRegion = "ap-northeast-2" // 기본값: 서울 리전
+	}
+
+	var dbUser, dbPass, dbHost, dbPort, dbName string
+
+	// AWS Secrets Manager 사용 여부 확인 (로컬 개발 시 .env 사용 가능)
+	useSecretsManager := os.Getenv("USE_SECRETS_MANAGER")
+	if useSecretsManager == "true" || useSecretsManager == "1" {
+		// Secrets Manager에서는 username, password만 가져옴
+		log.Printf("AWS Secrets Manager에서 DB 인증 정보를 가져옵니다: %s (Region: %s)", secretName, awsRegion)
+		creds, err := getSecretFromAWS(secretName, awsRegion)
 		if err != nil {
-			log.Println("Note: .env 파일을 찾을 수 없습니다. 환경 변수를 직접 사용합니다.")
+			log.Fatalf("AWS Secrets Manager 조회 실패: %v", err)
+		}
+		dbUser = creds.Username
+		dbPass = creds.Password
+		log.Println("AWS Secrets Manager에서 DB 인증 정보를 성공적으로 가져왔습니다.")
+
+		// Host, Port, DBName은 환경 변수에서 가져옴
+		dbHost = os.Getenv("DB_HOST")
+		dbPort = os.Getenv("DB_PORT")
+		if dbPort == "" {
+			dbPort = "3306"
+		}
+		dbName = os.Getenv("DB_NAME")
+
+		// 필수 값 확인
+		if dbHost == "" {
+			log.Fatal("DB_HOST 환경 변수가 설정되지 않았습니다.")
+		}
+		if dbName == "" {
+			log.Fatal("DB_NAME 환경 변수가 설정되지 않았습니다.")
+		}
+	} else {
+		// 로컬 개발용: 환경 변수 사용
+		log.Println("환경 변수에서 DB 정보를 가져옵니다 (로컬 개발 모드).")
+		dbUser = os.Getenv("DB_USER")
+		dbPass = os.Getenv("DB_PASS")
+		dbHost = os.Getenv("DB_HOST")
+		dbPort = os.Getenv("DB_PORT")
+		if dbPort == "" {
+			dbPort = "3306"
+		}
+		dbName = os.Getenv("DB_NAME")
+
+		// DB 설정이 없는 경우 임시로 기본값 사용
+		if dbUser == "" {
+			dbUser = "user"
+			dbPass = ""
+			dbHost = "localhost"
+			dbName = "ragdb"
+			log.Println("경고: 환경 변수가 설정되지 않아 임시 DB 연결 정보를 사용합니다.")
 		}
 	}
 
-	// 1. 환경 변수 설정 (AWS RDS 연결 정보)
-	// 실제 환경에서는 AWS Secrets Manager 또는 환경 변수를 통해 안전하게 관리해야 합니다.
-	dbUser := os.Getenv("DB_USER")
-	dbPass := os.Getenv("DB_PASS")
-	dbHost := os.Getenv("DB_HOST") // VPC 내부 RDS Endpoint
-	// DB 포트는 환경변수 DB_PORT로 오버라이드 가능합니다 (예: SSH 터널 포트 포워딩 시 사용)
-	dbPort := os.Getenv("DB_PORT")
-	if dbPort == "" {
-		dbPort = "3306"
-	}
-	dbName := os.Getenv("DB_NAME")
-
 	// SKIP_DB_CHECK: if set to "1" or "true", skip pinging the DB (useful when using SSH/SSM port forwarding or testing without DB)
-	// 개발/디버그 편의를 위해 DB 연결 확인을 건너뛸 수 있는 옵션
-	// SKIP_DB_CHECK=1 또는 SKIP_DB_CHECK=true 로 설정하면 PingContext를 수행하지 않습니다.
 	skipDBCheck := false
 	skipEnv := os.Getenv("SKIP_DB_CHECK")
 	if skipEnv == "1" || skipEnv == "true" || skipEnv == "TRUE" {
 		skipDBCheck = true
-	}
-
-	// DB 설정이 없는 경우 임시로 기본값 사용 (실제 환경에서는 오류 처리 필요)
-	if dbUser == "" {
-		dbUser = "user"
-		dbPass = ""
-		dbHost = "localhost" // 테스트를 위해 localhost로 설정
-		dbName = "ragdb"
-		log.Println("경고: 환경 변수가 설정되지 않아 임시 DB 연결 정보를 사용합니다. 실제 AWS 환경에서 DB_USER/PASS/HOST/NAME을 설정해야 합니다.")
 	}
 
 	// 2. AWS RDS MySQL 연결 (선택적으로 건너뛰기 가능)

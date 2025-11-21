@@ -4,6 +4,3 @@
 # 빌드된 실행 파일
 *.exe
 hamo
-
-# Go 모듈 캐시
-go.sum
